@@ -25,8 +25,7 @@ module invest_platform::platform {
     struct Member has key, store {
         total_balance: u64,
         portfolio: SmartTable<String, Investment>,
-        added_at: u64,
-        withdrawal_history: SmartVector<WithdrawalRecord>, // Track withdrawals in a period
+        added_at: u64
     }
 
     struct Contribution has store {
@@ -42,6 +41,7 @@ module invest_platform::platform {
         current_value: u64,    // Current total value of the investment
         invested_at: u64,    // Timestamp of the first contribution
         last_distributed_at: u64, // Track the last time profits were distributed
+        withdrawal_history: SmartVector<WithdrawalRecord>, // Track withdrawals per investment
     }
     struct WithdrawalRecord has copy, drop, store {
         amount: u64,        // Amount withdrawn
@@ -121,7 +121,6 @@ module invest_platform::platform {
             total_balance: 0,
             portfolio: smart_table::new(),
             added_at: timestamp::now_seconds(),
-            withdrawal_history: smart_vector::empty()
         };
         smart_table::add(&mut registry.members, member_addr, member);
         registry.total_members = registry.total_members + 1;
@@ -153,7 +152,8 @@ module invest_platform::platform {
             initial_value: 0,
             current_value: 0,
             invested_at: timestamp::now_seconds(),
-            last_distributed_at: timestamp::now_seconds()
+            last_distributed_at: timestamp::now_seconds(),
+            withdrawal_history: smart_vector::empty()
         };
         smart_table::add(&mut member.portfolio, invest_id, invest);
 
@@ -227,33 +227,42 @@ module invest_platform::platform {
 
         let member = smart_table::borrow_mut(&mut registry.members, member_addr);
 
-        // Check if the member has enough unlocked balance
-        let available_balance = calculate_available_balance(member);
+        // Ensure the investment exists in the member's portfolio
+        if (!smart_table::contains(&member.portfolio, invest_id)) {
+            abort(E_INVALID_INVESTMENT_ID); // Investment ID does not exist
+        };
+
+        let invest = smart_table::borrow_mut(&mut member.portfolio, invest_id);
+
+        // Calculate the available balance for this specific investment
+        let available_balance = calculate_available_balance_for_investment(invest);
+
+        // Ensure the user has enough available balance in this investment to withdraw
         if (available_balance < amount) {
-            abort(E_INSUFFICIENT_BALANCE); // Not enough unlocked funds to withdraw
+            abort(E_INSUFFICIENT_BALANCE); // Not enough unlocked funds in the investment
         };
 
-        // Calculate the maximum withdrawal limit for the current period
-        let max_withdrawal_per_period = calculate_max_withdrawal_per_period(member);
+        // Calculate the maximum withdrawal limit for this investment for the current period
+        let max_withdrawal_per_period = calculate_max_withdrawal_per_investment(invest);
 
-        // Get the total amount already withdrawn in the current period
-        let withdrawn_in_period = get_withdrawn_in_current_period(member);
-
-        // Ensure the requested withdrawal does not exceed the limit for the current period
+        // Get the total amount already withdrawn from this investment in the current period
+        let withdrawn_in_period = get_withdrawn_in_current_period_for_investment(invest);
+        // Ensure the requested withdrawal does not exceed the limit for this investment in the current period
         if (withdrawn_in_period + amount > max_withdrawal_per_period) {
-            abort(E_EXCEEDS_WITHDRAWAL_LIMIT); // Withdrawal exceeds maximum limit for the period
+            abort(E_EXCEEDS_WITHDRAWAL_LIMIT); // Withdrawal exceeds maximum limit for this investment
         };
-        
-        // Update the member's total balance and registry's total funds
+
+        // Proceed with the withdrawal
+        invest.current_value = invest.current_value - amount;
         member.total_balance = member.total_balance - amount;
         registry.total_funds = registry.total_funds - amount;
-
+        
         // Record the withdrawal in the member's history
         let record = WithdrawalRecord {
             amount,
             withdrawn_at: timestamp::now_seconds(),
         };
-        smart_vector::push_back(&mut member.withdrawal_history, record);
+        smart_vector::push_back(&mut invest.withdrawal_history, record);
 
         // Emit an event for the withdrawal
         event::emit(Withdrawal {
@@ -264,52 +273,48 @@ module invest_platform::platform {
         });
     }
 
-    // Helper function to calculate the available balance of unlocked funds
-    fun calculate_available_balance(member: &Member): u64 {
+    fun calculate_available_balance_for_investment(invest: &Investment): u64 {
         let current_time = timestamp::now_seconds();
-        let  available_balance = 0;
+        let available_balance = 0;
 
-        // Loop through each investment in the portfolio
-        smart_table::for_each_ref(&member.portfolio, |_, investment| {
         // Loop through each contribution in the investment
-        smart_vector::for_each(investment.contributions, |contribution| {
-        // Check if the lock period has passed for each contribution
-        if (current_time - contribution.contributed_at >= MIN_LOCK_PERIOD) {
-        available_balance = available_balance + contribution.amount;
-        }
-        });
+        smart_vector::for_each(invest.contributions, |contribution| {
+            // Check if the lock period has passed for each contribution
+            if (current_time - contribution.contributed_at >= MIN_LOCK_PERIOD) {
+                available_balance = available_balance + contribution.amount;
+            }
         });
 
         available_balance
     }
 
-    fun calculate_max_withdrawal_per_period(member: &Member): u64 {
-        let total_balance = member.total_balance;
+    fun calculate_max_withdrawal_per_investment(invest: &Investment): u64 {
+        let current_value = invest.current_value;
         let current_time = timestamp::now_seconds();
 
-        // Calculate the time the member has spent on the platform (in months)
-        let time_in_club = (current_time - member.added_at) / (60 * 60 * 24 * 30); // Time in months
+        // Calculate the time since the investment was made (in months)
+        let time_in_investment = (current_time - invest.invested_at) / (60 * 60 * 24 * 120); // Time in months
 
-        // Set a base withdrawal limit as a percentage of total balance
-        let base_percentage: u64 = 10; // Start with 10% of the balance
-        let time_based_increase: u64 = 2; // Increase by 2% for each month on the platform
+        // Set a base withdrawal limit as a percentage of the current value
+        let base_percentage: u64 = 10; // Start with 10% of the value
+        let time_based_increase: u64 = 2; // Increase by 2% for each month since the investment was made
 
-        // Calculate the total percentage based on balance and time
-        let total_percentage = base_percentage + (time_based_increase * time_in_club);
+        // Calculate the total percentage based on the value and time
+        let total_percentage = base_percentage + (time_based_increase * time_in_investment);
 
-        // Calculate the maximum withdrawal limit per period based on the total percentage of the balance
-        let max_withdrawal_per_period = total_balance * total_percentage / 100;
+        // Calculate the maximum withdrawal limit for the investment based on the total percentage of the current value
+        let max_withdrawal_per_investment = current_value * total_percentage / 100;
 
-        max_withdrawal_per_period
+        max_withdrawal_per_investment
     }
 
-    fun get_withdrawn_in_current_period(member: &Member): u64 {
+    fun get_withdrawn_in_current_period_for_investment(invest: &Investment): u64 {
         let current_time = timestamp::now_seconds();
         let period_start = current_time - WITHDRAWAL_PERIOD;
         let total_withdrawn_in_period = 0;
 
-        // Sum all withdrawals that occurred within the current period
-        smart_vector::for_each(member.withdrawal_history, |record| {
+        // Sum all withdrawals that occurred within the current period for this investment
+        smart_vector::for_each(invest.withdrawal_history, |record| {
         if (record.withdrawn_at >= period_start) {
         total_withdrawn_in_period = total_withdrawn_in_period + record.amount;
         }
@@ -317,7 +322,7 @@ module invest_platform::platform {
 
         total_withdrawn_in_period
     }
-    
+
     public entry fun distribute_profits(signer: &signer, profit: u128, invest_id: String) acquires ClubRegistry {
         let member_addr = signer::address_of(signer);
         let registry = borrow_global_mut<ClubRegistry>(@invest_platform);
@@ -366,6 +371,5 @@ module invest_platform::platform {
             invest.current_value = invest.current_value + share_of_profit;
         });
     }
-
 
 }
