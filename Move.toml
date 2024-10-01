@@ -1,0 +1,16 @@
+[package]
+name = "invest_platform"
+version = "1.0.0"
+authors = []
+
+[addresses]
+invest_platform ="0xf4bbfe044f5a59017293e5fabb75cfca8e719868fe442543f4860ad71c309af3"
+
+[dev-addresses]
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-core.git"
+rev = "mainnet"
+subdir = "aptos-move/framework/aptos-framework"
+
+[dev-dependencies]
